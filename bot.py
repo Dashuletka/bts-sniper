@@ -1,157 +1,119 @@
-import requests
-import time
-import hashlib
-import json
+import asyncio
+from playwright.async_api import async_playwright
+from telegram import Bot
 import os
-from bs4 import BeautifulSoup
-from datetime import datetime
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL = 30
+bot = Bot(token=BOT_TOKEN)
 
-URLS = {
-    "Ticketmaster BTS Munich": "https://www.ticketmaster.de/artist/bts-tickets/958687",
-    "TicketSwap": "https://www.ticketswap.com/"
-}
+URLS = [
+    {
+        "name": "Ticketmaster BTS Munich",
+        "url": "https://www.ticketmaster.de/artist/bts-tickets/958687"
+    },
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
-}
+    {
+        "name": "BTS Munich 11 July 2026",
+        "url": "https://www.ticketswap.com/concert-tickets/bts-munich-allianz-arena-2026-07-11-CX6shmt4gwPx9g8nDxRcf"
+    },
 
-POSITIVE_HINTS = [
+    {
+        "name": "BTS Munich 12 July 2026",
+        "url": "https://www.ticketswap.com/concert-tickets/bts-munich-allianz-arena-2026-07-12-CXNexsCWNaYDBiWKZnpGw"
+    }
+]
+
+GOOD_WORDS = [
     "available",
-    "find tickets",
-    "limited availability",
-    "resale",
-    "1 ticket",
+    "tickets",
+    "buy",
+    "from",
+    "vip",
+    "resale"
 ]
 
-NEGATIVE_HINTS = [
-    "few or no tickets available",
-    "sold out",
-    "not available",
-]
 
-STATE = {}
+async def check_page(page_info):
+    print(f"\nChecking: {page_info['name']}")
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with async_playwright() as p:
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text[:4000],
-        "disable_web_page_preview": True,
-    }
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
 
-    requests.post(url, data=payload, timeout=20)
+        page = await browser.new_page()
 
-def normalize(html):
-    soup = BeautifulSoup(html, "html.parser")
+        await page.set_extra_http_headers({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0 Safari/537.36"
+            )
+        })
 
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+        try:
+            await page.goto(
+                page_info["url"],
+                timeout=60000,
+                wait_until="networkidle"
+            )
 
-    text = soup.get_text(" ", strip=True)
-    text = " ".join(text.split())
+            content = (await page.content()).lower()
 
-    return text.lower()
+            found = []
 
-def fingerprint(text):
-    return hashlib.sha256(text.encode()).hexdigest()
+            for word in GOOD_WORDS:
+                if word in content:
+                    found.append(word)
 
-def analyze(text):
-    positive = [x for x in POSITIVE_HINTS if x in text]
-    negative = [x for x in NEGATIVE_HINTS if x in text]
+            if found:
 
-    return {
-        "positive": positive,
-        "negative": negative,
-        "has_positive": len(positive) > 0,
-        "has_negative": len(negative) > 0,
-    }
+                text = (
+                    f"🚨 BTS КВИТКИ МОЖЛИВО З'ЯВИЛИСЬ!\n\n"
+                    f"{page_info['name']}\n"
+                    f"{page_info['url']}\n\n"
+                    f"Знайдено слова:\n"
+                    f"{', '.join(found)}"
+                )
 
-def fetch(url):
-    r = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30,
-        allow_redirects=True,
+                print(text)
+
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=text
+                )
+
+            else:
+                print("Нічого не знайдено")
+
+        except Exception as e:
+            print(f"Помилка: {e}")
+
+        await browser.close()
+
+
+async def main():
+
+    await bot.send_message(
+        chat_id=CHAT_ID,
+        text="🤖 BTS sniper bot запущений!"
     )
 
-    r.raise_for_status()
-
-    return r.text
-
-def check(name, url):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {name}")
-
-    try:
-        html = fetch(url)
-    except Exception as e:
-        print(e)
-        return
-
-    text = normalize(html)
-
-    fp = fingerprint(text)
-    flags = analyze(text)
-
-    old = STATE.get(name)
-
-    STATE[name] = {
-        "fp": fp,
-        "negative": flags["has_negative"],
-    }
-
-    if old is None:
-        return
-
-    changed = old["fp"] != fp
-
-    # найважливіший сигнал
-    if old["negative"] and not flags["has_negative"]:
-        message = (
-            f"🚨 МОЖЛИВО BTS КВИТКИ З'ЯВИЛИСЯ\\n\\n"
-            f"{name}\\n"
-            f"{url}"
-        )
-
-        print(message)
-        send_telegram(message)
-
-        return
-
-    if changed and flags["has_positive"]:
-        message = (
-            f"✨ Сторінка змінилась\\n\\n"
-            f"{name}\\n"
-            f"{url}"
-        )
-
-        print(message)
-        send_telegram(message)
-
-def main():
-    send_telegram("🤖 BTS sniper started")
-
     while True:
-        for name, url in URLS.items():
-            try:
-                check(name, url)
-            except Exception as e:
-                print(e)
 
-            time.sleep(5)
+        for page_info in URLS:
+            await check_page(page_info)
 
-        print(f"Sleep {CHECK_INTERVAL} sec...")
-        time.sleep(CHECK_INTERVAL)
+        print("\nSleep 30 sec...\n")
 
-if __name__ == "__main__":
-    main()
+        await asyncio.sleep(30)
+
+
+asyncio.run(main())
